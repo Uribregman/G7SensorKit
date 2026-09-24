@@ -118,6 +118,14 @@ public final class G7Sensor: G7BluetoothManagerDelegate {
         bluetoothManager.scanForPeripheral()
     }
 
+    /// Drop the current connection and find the same sensor again. Unlike
+    /// `scanForNewSensor()` this keeps `sensorID`, so only this sensor is accepted.
+    public func reconnectToSensor() {
+        bluetoothManager.disconnect()
+        bluetoothManager.forgetPeripheral()
+        bluetoothManager.scanForPeripheral()
+    }
+
     public func stopScanning() {
         bluetoothManager.disconnect()
     }

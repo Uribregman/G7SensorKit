@@ -17,6 +17,16 @@ private class TestBluetoothManager: G7BluetoothManager {
     }
 }
 
+/// Counts `forgetPeripheral()`: both recovery steps drop the connection through it.
+private class CountingBluetoothManager: TestBluetoothManager {
+    var forgetCount = 0
+
+    override func forgetPeripheral() {
+        forgetCount += 1
+        super.forgetPeripheral()
+    }
+}
+
 final class G7CGMManagerTests: XCTestCase {
 
     private static let sensorID = "DXCM99"
@@ -196,6 +206,82 @@ final class G7CGMManagerTests: XCTestCase {
         }
         wait(for: [graceElapsed], timeout: 5)
 
+        XCTAssertEqual(Self.sensorID, manager.state.sensorID)
+    }
+
+    // MARK: - Failed handshakes
+
+    private var clock = Date()
+    private var bluetooth: CountingBluetoothManager!
+
+    private func makeHandshakeManager() -> G7CGMManager {
+        var state = G7CGMManagerState()
+        state.sensorID = Self.sensorID
+        state.activatedAt = Date(timeIntervalSinceNow: -54000)
+        bluetooth = CountingBluetoothManager()
+        let manager = G7CGMManager(state: state, sensor: G7Sensor(sensorID: state.sensorID, bluetoothManager: bluetooth))
+        manager.now = { [unowned self] in self.clock }
+        return manager
+    }
+
+    /// One failed connection, then the next one 5 minutes later.
+    private func failHandshake(_ manager: G7CGMManager) {
+        clock = clock.addingTimeInterval(300)
+        manager.sensor(manager.sensor, didError: G7SensorError.controlError("Error enabling notification for authentication: unknownCharacteristic"))
+    }
+
+    func testOneFailedHandshakeKeepsConnection() {
+        let manager = makeHandshakeManager()
+        failHandshake(manager)
+
+        XCTAssertEqual(0, bluetooth.forgetCount)
+        XCTAssertEqual(Self.sensorID, manager.state.sensorID)
+    }
+
+    func testTwoFailedHandshakesReconnectToSameSensor() {
+        let manager = makeHandshakeManager()
+        failHandshake(manager)
+        failHandshake(manager)
+
+        XCTAssertEqual(1, bluetooth.forgetCount)
+        XCTAssertEqual(Self.sensorID, manager.state.sensorID)
+    }
+
+    func testErrorsFromOneConnectionCountOnce() {
+        let manager = makeHandshakeManager()
+        failHandshake(manager)
+        // A second error 4 seconds later, from the same connection window.
+        clock = clock.addingTimeInterval(4)
+        manager.sensor(manager.sensor, didError: G7SensorError.controlError("Error enabling notification for authentication: timeout"))
+
+        XCTAssertEqual(0, bluetooth.forgetCount)
+    }
+
+    func testFourFailedHandshakesForgetSensor() {
+        let manager = makeHandshakeManager()
+        for _ in 0..<4 { failHandshake(manager) }
+
+        XCTAssertEqual(2, bluetooth.forgetCount) // reconnect, then the rescan
+        XCTAssertNil(manager.state.sensorID)
+    }
+
+    func testReadingResetsFailedHandshakes() {
+        let manager = makeHandshakeManager()
+        failHandshake(manager)
+        manager.sensor(manager.sensor, didRead: okGlucoseMessage)
+        failHandshake(manager)
+
+        XCTAssertEqual(0, bluetooth.forgetCount)
+    }
+
+    func testOtherErrorsAreNotHandshakeFailures() {
+        let manager = makeHandshakeManager()
+        for _ in 0..<4 {
+            clock = clock.addingTimeInterval(300)
+            manager.sensor(manager.sensor, didError: G7SensorError.observationError("Unable to handle glucose control response"))
+        }
+
+        XCTAssertEqual(0, bluetooth.forgetCount)
         XCTAssertEqual(Self.sensorID, manager.state.sensorID)
     }
 }

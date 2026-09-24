@@ -27,6 +27,17 @@ public class G7CGMManager: CGMManager {
     /// readings normally resume on the sensor's next 5-minute connection cycle.
     var suspectedSessionEndGracePeriod: TimeInterval = TimeInterval(minutes: 15)
 
+    /// Connections in a row whose notification setup failed, with no reading since.
+    /// Only touched on the sensor's delegate queue. See `noteFailedHandshake()`.
+    private var failedHandshakeCount = 0
+    private var lastFailedHandshakeAt: Date?
+    /// Failed connections before dropping the connection and finding the same sensor again.
+    var failedHandshakesBeforeReconnect = 2
+    /// Failed connections before forgetting the sensor and scanning, as a last resort.
+    var failedHandshakesBeforeRescan = 4
+    /// Test seam for the clock.
+    var now: () -> Date = { Date() }
+
     public var state: G7CGMManagerState {
         return lockedState.value
     }
@@ -442,12 +453,54 @@ extension G7CGMManager: G7SensorDelegate {
 
     public func sensor(_ sensor: G7Sensor, didError error: Error) {
         logDeviceCommunication("Sensor error \(error)", type: .error)
+
+        // `.controlError` is only thrown when enabling notifications fails.
+        if case G7SensorError.controlError = error {
+            noteFailedHandshake()
+        }
+    }
+
+    /// The sensor can keep connecting every 5 minutes while enabling notifications
+    /// fails each time (unknownCharacteristic or timeout), so nothing gets through.
+    /// It is not a suspected session end, so nothing recovers it until the sensor
+    /// is forgotten and found again. In the field that gave 70- and 75-minute gaps
+    /// at night while the Dexcom app had every reading.
+    ///
+    /// Recover in two steps: after `failedHandshakesBeforeReconnect` failed
+    /// connections, drop the connection and find the same sensor again; if that
+    /// does not help by `failedHandshakesBeforeRescan`, forget the sensor and scan.
+    func noteFailedHandshake() {
+        // Already scanning for a sensor: nothing to reset.
+        guard state.sensorID != nil else { return }
+
+        // One connection window can report several errors; count it once.
+        let date = now()
+        if let last = lastFailedHandshakeAt, date.timeIntervalSince(last) < 60 {
+            return
+        }
+        lastFailedHandshakeAt = date
+        failedHandshakeCount += 1
+
+        if failedHandshakeCount >= failedHandshakesBeforeRescan {
+            logDeviceCommunication("Handshake failed on \(failedHandshakeCount) connections in a row after reconnecting.", type: .connection)
+            resetFailedHandshakes()
+            scanForNewSensor()
+        } else if failedHandshakeCount == failedHandshakesBeforeReconnect {
+            logDeviceCommunication("Handshake failed on \(failedHandshakeCount) connections in a row; reconnecting to the sensor.", type: .connection)
+            sensor.reconnectToSensor()
+        }
+    }
+
+    private func resetFailedHandshakes() {
+        failedHandshakeCount = 0
+        lastFailedHandshakeAt = nil
     }
 
     public func sensor(_ sensor: G7Sensor, didRead message: G7GlucoseMessage) {
 
         // Receiving any glucose message proves the session is still active.
         cancelSuspectedSessionEndScan()
+        resetFailedHandshakes()
 
         guard message != latestReading else {
             logDeviceCommunication("Sensor reading duplicate: \(message)", type: .error)
